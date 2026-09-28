@@ -1,13 +1,13 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI
 from pydantic import BaseModel
 import numpy as np
 import onnxruntime as ort
 import yfinance as yf
 from typing import Optional
+import time
 
 app = FastAPI()
 
-# Load model once at startup
 ort_session = ort.InferenceSession("fx_beast_lstm.onnx")
 
 SCALER_MEAN = np.array([2.54e-6, 1.746e-5, 50.49797161, 0.03999965, 0.02667172, 0.05687337,
@@ -32,6 +32,9 @@ YAHOO_SYMBOLS = {
     "EUR/NZD": "EURNZD=X", "AUD/NZD": "AUDNZD=X",
 }
 
+_cache = {"data": None, "timestamp": 0}
+CACHE_TTL = 60
+
 def ema(arr, period):
     k = 2 / (period + 1)
     out = np.zeros_like(arr); out[0] = arr[0]
@@ -55,18 +58,15 @@ def atr_series(h, l, c, period=14):
     for i in range(1, len(c)): out[i] = (out[i-1] * (period-1) + tr[i]) / period
     return out
 
-def build_features(df):
-    o = df["Open"].values.astype(np.float32)
-    h = df["High"].values.astype(np.float32)
-    l = df["Low"].values.astype(np.float32)
-    c = df["Close"].values.astype(np.float32)
-    v = df["Volume"].values.astype(np.float32)
+def build_features(o, h, l, c, v):
+    o = o.astype(np.float32); h = h.astype(np.float32)
+    l = l.astype(np.float32); c = c.astype(np.float32); v = v.astype(np.float32)
     e8, e21, e50 = ema(c, 8), ema(c, 21), ema(c, 50)
     r14 = rsi_series(c, 14)
     a14 = atr_series(h, l, c, 14)
     n = len(c)
-    vol_mean = v.mean()
-    vol_std = v.std() or 1e-9
+    vol_mean = v.mean() if len(v) else 0
+    vol_std = v.std() if len(v) else 1e-9
     rows = []
     for i in range(n):
         ret1 = (c[i] - c[i-1]) / c[i-1] if i > 0 else 0
@@ -78,7 +78,7 @@ def build_features(df):
             (e21[i] - e50[i]) / (a14[i] + 1e-9),
             (h[i] - l[i]) / (a14[i] + 1e-9),
             (c[i] - o[i]) / (a14[i] + 1e-9),
-            (v[i] - vol_mean) / vol_std,
+            (v[i] - vol_mean) / (vol_std + 1e-9),
             c[i] / e8[i] - 1, c[i] / e21[i] - 1, c[i] / e50[i] - 1,
             a14[i] / (c[i] + 1e-9),
             i / n,
@@ -94,18 +94,45 @@ def health():
 
 @app.post("/predict")
 def predict(req: PredictRequest):
-    pairs = [req.pair] if req.pair else list(YAHOO_SYMBOLS.keys())
+    global _cache
+    now = time.time()
+    if _cache["data"] and (now - _cache["timestamp"]) < CACHE_TTL and not req.pair:
+        return _cache["data"]
+
+    symbols_to_check = YAHOO_SYMBOLS
+    if req.pair:
+        symbols_to_check = {req.pair: YAHOO_SYMBOLS[req.pair]} if req.pair in YAHOO_SYMBOLS else {}
+
+    if not symbols_to_check:
+        return {"predictions": [], "errors": []}
+
+    tickers = list(symbols_to_check.values())
+    try:
+        batch = yf.download(
+            tickers, period="2mo", interval="1h",
+            progress=False, auto_adjust=False, threads=True, group_by="ticker",
+        )
+    except Exception as e:
+        return {"predictions": [], "errors": [{"error": f"batch download failed: {e}"}]}
+
+    if batch is None or len(batch) == 0:
+        return {"predictions": [], "errors": [{"error": "empty batch"}]}
+
     results = []
-    for pair in pairs:
+    errors_list = []
+
+    for pair, symbol in symbols_to_check.items():
         try:
-            symbol = YAHOO_SYMBOLS.get(pair)
-            if not symbol: continue
-            df = yf.download(symbol, period="2mo", interval="1h", progress=False, auto_adjust=False)
-            if len(df) < SEQ_LEN + 10: continue
-            if hasattr(df.columns, "get_level_values"):
-                df.columns = df.columns.get_level_values(0)
-            df = df.dropna()
-            F = build_features(df)
+            if len(symbols_to_check) > 1:
+                df = batch[symbol].dropna()
+            else:
+                df = batch.dropna()
+            if len(df) < SEQ_LEN + 10:
+                errors_list.append({"pair": pair, "error": f"insufficient bars ({len(df)})"})
+                continue
+            F = build_features(df["Open"].values, df["High"].values,
+                               df["Low"].values, df["Close"].values,
+                               df["Volume"].values if "Volume" in df else np.zeros(len(df)))
             seq = F[-SEQ_LEN:]
             scaled = (seq - SCALER_MEAN) / (SCALER_STD + 1e-9)
             inp = scaled.reshape(1, SEQ_LEN, N_FEATURES).astype(np.float32)
@@ -120,5 +147,13 @@ def predict(req: PredictRequest):
                 "direction": "BUY" if prob_up > 0.5 else "SELL",
             })
         except Exception as e:
-            results.append({"pair": pair, "error": str(e)})
-    return {"predictions": [r for r in results if "error" not in r], "errors": [r for r in results if "error" in r]}
+            errors_list.append({"pair": pair, "error": str(e)})
+
+    result = {"predictions": results, "errors": errors_list}
+
+    if not req.pair:
+        _cache["data"] = result
+        _cache["timestamp"] = now
+
+    return result
+
