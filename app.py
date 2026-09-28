@@ -8,6 +8,26 @@ import time
 
 app = FastAPI()
 
+from fastapi import FastAPI
+from pydantic import BaseModel
+import numpy as np
+import onnxruntime as ort
+import yfinance as yf
+from typing import Optional
+import time
+
+app = FastAPI()
+
+from fastapi import FastAPI
+from pydantic import BaseModel
+import numpy as np
+import onnxruntime as ort
+import yfinance as yf
+from typing import Optional
+import time
+
+app = FastAPI()
+
 ort_session = ort.InferenceSession("fx_beast_lstm.onnx")
 
 SCALER_MEAN = np.array([2.54e-6, 1.746e-5, 50.49797161, 0.03999965, 0.02667172, 0.05687337,
