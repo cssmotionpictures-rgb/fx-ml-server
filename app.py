@@ -158,7 +158,8 @@ def predict(req: PredictRequest):
             inp = scaled.reshape(1, SEQ_LEN, N_FEATURES).astype(np.float32)
             input_name = ort_session.get_inputs()[0].name
             outputs = ort_session.run(None, {input_name: inp})
-            prob_up = float(outputs[0][0][0])
+logit = float(outputs[0][0][0])
+prob_up = float(1.0 / (1.0 + np.exp(-np.clip(logit, -50, 50))))
             results.append({
                 "pair": pair,
                 "prob_up": prob_up,
